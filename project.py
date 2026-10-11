@@ -2,300 +2,285 @@
 # -*- coding: utf-8 -*-
 """
 Created on Thu Jun 12 16:40:53 2025
+Revised Oct 2026: purged walk-forward validation, scale-free features,
+baseline comparison, transaction costs and risk metrics.
 
 @author: jacob
 """
 
 # %%
 # Import necessary libraries
-import pandas as pd
-import yfinance as yf
+import os
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sn
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import confusion_matrix
 
 # %%
-# Define list of tickers and prepare data dictionary
+# Configuration
 tickers = ['AAPL', 'NVDA', 'WMT', 'KO', 'XOM', 'CVX', 'JPM', 'BRK-B', 'JNJ', 'LLY']
-data = {}
+DATA_DIR = "stock_data_csv"
+HORIZON = 21          # prediction horizon in trading days (~1 month)
+TRAIN_WINDOW = 252    # rolling training window (~1 year)
+TEST_SIZE = 21        # rows predicted per walk-forward step
+PURGE = HORIZON       # rows dropped from the end of each training window (see README)
+COST_BPS = 5          # transaction cost per side, in basis points
+DOWNLOAD = False      # True re-downloads data from Yahoo Finance (results will change)
+SHOW_PLOTS = False    # True shows matplotlib plots when run as a script
 
 # %%
-# Download the past 5 years of data for each ticker
-for ticker in tickers:    
-    df = yf.download(ticker, period='5y')
-    df.dropna(inplace=True)
-    data[ticker] = df
+# Download the past 5 years of data for each ticker (only if requested or missing)
+if DOWNLOAD or not all(os.path.exists(f"{DATA_DIR}/{t}.csv") for t in tickers):
+    import yfinance as yf
+    os.makedirs(DATA_DIR, exist_ok=True)
+    ohlcv_keywords = ['Open', 'High', 'Low', 'Close', 'Volume']
+    for ticker in tickers:
+        df = yf.download(ticker, period='5y')
+        df.dropna(inplace=True)
+        ohlcv_cols = [col for col in df.columns if any(key in col for key in ohlcv_keywords)]
+        df[ohlcv_cols].to_csv(f"{DATA_DIR}/{ticker}.csv", index=True)
 
 # %%
-import os
-os.makedirs("stock_data_csv", exist_ok=True)
-
-# Save only OHLCV columns
-ohlcv_keywords = ['Open', 'High', 'Low', 'Close', 'Volume']
-
-for ticker, df in data.items():
-    ohlcv_cols = [col for col in df.columns if any(key in col for key in ohlcv_keywords)]
-    df_filtered = df[ohlcv_cols]
-    df_filtered.to_csv(f"stock_data_csv/{ticker}.csv", index=True)
-
-# %%
-
 # Load data from saved CSV files
 data = {}
 for ticker in tickers:
-    df = pd.read_csv(f"stock_data_csv/{ticker}.csv", header=[0, 1], index_col=0, parse_dates=True)
-    df.columns = ['_'.join(col).strip() if '_' not in col[0] else col[0] for col in df.columns.values]
+    df = pd.read_csv(f"{DATA_DIR}/{ticker}.csv", header=[0, 1], index_col=0, parse_dates=True)
+    df.columns = [col[0] for col in df.columns.values]   # 'Close', 'High', ...
+    data[ticker] = df.sort_index()
+
+# %%
+# Feature engineering
+# Every feature is scale-free (a ratio, return or bounded oscillator). Raw price
+# levels such as Close or SMA50 trend over time, so a tree model trained on last
+# year's price range cannot extrapolate to this year's; they are deliberately excluded.
+FEATURES = ['RSI14', 'MACD', 'MACDhist', 'Volatility21', 'DistSMA20', 'DistSMA50',
+            'EMA20vsEMA50', 'BollingerPctB', 'Return10', 'Sharpe21']
+
+def add_features(df, price_col='Close'):
+    p = df[price_col]
+    ret = p.pct_change()
+
+    # RSI (14)
+    delta = p.diff()
+    avg_gain = delta.clip(lower=0).rolling(14).mean()
+    avg_loss = (-delta.clip(upper=0)).rolling(14).mean()
+    df['RSI14'] = 100 - 100 / (1 + avg_gain / avg_loss)
+
+    # MACD, normalised by price
+    macd = p.ewm(span=12, adjust=False).mean() - p.ewm(span=26, adjust=False).mean()
+    signal = macd.ewm(span=9, adjust=False).mean()
+    df['MACD'] = macd / p
+    df['MACDhist'] = (macd - signal) / p
+
+    # Volatility of daily returns (21-day)
+    df['Volatility21'] = ret.rolling(21).std()
+
+    # Distance from moving averages
+    df['DistSMA20'] = p / p.rolling(20).mean() - 1
+    df['DistSMA50'] = p / p.rolling(50).mean() - 1
+    df['EMA20vsEMA50'] = p.ewm(span=20, adjust=False).mean() / p.ewm(span=50, adjust=False).mean() - 1
+
+    # Bollinger %B: 0 at the lower band, 1 at the upper band
+    sma20, std20 = p.rolling(20).mean(), p.rolling(20).std()
+    df['BollingerPctB'] = (p - (sma20 - 2 * std20)) / (4 * std20)
+
+    # Momentum and short-term risk-adjusted return
+    df['Return10'] = p.pct_change(10)
+    df['Sharpe21'] = ret.rolling(21).mean() / ret.rolling(21).std()
+    return df
+
+# %%
+# Apply features and generate the target: does the price rise over the next HORIZON days?
+for ticker, df in data.items():
+    df = add_features(df)
+    df['FwdReturn'] = df['Close'].shift(-HORIZON) / df['Close'] - 1
+    # The last HORIZON rows have no known future price. Drop them rather than
+    # letting the comparison with NaN silently label them as "down".
+    df = df.dropna(subset=FEATURES + ['FwdReturn'])
+    df['Target'] = (df['FwdReturn'] > 0).astype(int)
     data[ticker] = df
 
-# %% 
-# Function to compute technical indicators
-def add_technical_indicators(df, price_col):
-    # RSI (14)
-    delta = df[price_col].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=14).mean()
-    avg_loss = loss.rolling(window=14).mean()
-    rs = avg_gain / avg_loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema12 = df[price_col].ewm(span=12, adjust=False).mean()
-    ema26 = df[price_col].ewm(span=26, adjust=False).mean()
-    df['MACD'] = ema12 - ema26
-    df['MACDsignal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACDhist'] = df['MACD'] - df['MACDsignal']
-
-    # Volatility (21-day rolling standard deviation)
-    df['Volatility'] = df[price_col].rolling(window=21).std()
-
-    # Simple Moving Averages
-    df['SMA20'] = df[price_col].rolling(window=20).mean()
-    df['SMA50'] = df[price_col].rolling(window=50).mean()
-
-    # Exponential Moving Averages
-    df['EMA20'] = df[price_col].ewm(span=20, adjust=False).mean()
-    df['EMA50'] = df[price_col].ewm(span=50, adjust=False).mean()
-
-    # Bollinger Bands (20-day SMA ± 2 * std)
-    sma20 = df[price_col].rolling(window=20).mean()
-    std20 = df[price_col].rolling(window=20).std()
-    df['BBupper'] = sma20 + (2 * std20)
-    df['BBlower'] = sma20 - (2 * std20)
-
-    # Momentum (10-day)
-    df['Momentum10'] = df[price_col] - df[price_col].shift(10)
-
-    df['Sharpe21'] = df[price_col].pct_change().rolling(21).mean() / df[price_col].pct_change().rolling(21).std()
-
-    return df.dropna()
-
 # %%
-# Apply indicators and generate target variable
-for ticker, df in data.items():
-    price_col = f'Close_{ticker}'
-    df = add_technical_indicators(df, price_col=price_col)
-    df['Target'] = (df[price_col].shift(-21) > df[price_col]).astype(int)
-    data[ticker] = df.dropna()
+# Purged walk-forward validation
+def walk_forward_validation(X, y, window_size=TRAIN_WINDOW, test_size=TEST_SIZE, purge=PURGE):
+    """
+    Train on a rolling window and predict the next `test_size` rows.
 
-# %%
-# Import machine learning modules
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, confusion_matrix
-
-# %%
-# Function for walk-forward validation
-def walk_forward_validation(X, y, window_size=252, test_size=21):
-    results = []
-    all_y_true = []
-    all_y_pred = []
-    all_importances = []
-
+    The label of row t depends on prices up to t + HORIZON. Without a purge, the
+    last HORIZON training labels are computed from prices inside the test window,
+    so the model is partly trained on the answers. Dropping the last `purge`
+    rows of each training window removes that overlap.
+    """
+    y_true, y_pred, test_idx, importances = [], [], [], []
     for start in range(0, len(X) - window_size - test_size + 1, test_size):
         end_train = start + window_size
         end_test = end_train + test_size
 
-        X_train, y_train = X.iloc[start:end_train], y.iloc[start:end_train]
+        X_train = X.iloc[start:end_train - purge]
+        y_train = y.iloc[start:end_train - purge]
         X_test, y_test = X.iloc[end_train:end_test], y.iloc[end_train:end_test]
 
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        model = RandomForestClassifier(n_estimators=100, min_samples_leaf=5,
+                                       random_state=42)
         model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
 
-        acc = accuracy_score(y_test, y_pred)
-        results.append(acc)
-        all_y_true.extend(y_test)
-        all_y_pred.extend(y_pred)
-        all_importances.append(model.feature_importances_)
+        y_true.extend(y_test)
+        y_pred.extend(model.predict(X_test))
+        test_idx.extend(X_test.index)
+        importances.append(model.feature_importances_)
 
-    return results, all_y_true, all_y_pred, all_importances
+    return np.array(y_true), np.array(y_pred), pd.DatetimeIndex(test_idx), np.array(importances)
 
 # %%
-# Run model on each stock and store predictions and performance
+# Run model on each stock and store predictions with their dates
 results = {}
-
 for ticker in tickers:
-    df_ticker = data[ticker]
-    feature_cols = [col for col in df_ticker.columns if col not in ['Target']]
-    X = df_ticker[feature_cols]
-    y = df_ticker['Target']
-    df_ticker.sort_index(inplace=True)
-    scores, y_true, y_pred, importances = walk_forward_validation(X, y, window_size=252, test_size=21)
-    results[ticker] = (scores, y_true, y_pred, importances)
+    df = data[ticker]
+    y_true, y_pred, idx, importances = walk_forward_validation(df[FEATURES], df['Target'])
+    results[ticker] = (y_true, y_pred, idx, importances)
 
 # %%
-
-# Utility functions for strategy and buy-and-hold returns
-def compute_strategy_returns(df, price_col, prediction_col='Prediction', horizon=21):
-    wealth = 1.0
-    returns = pd.Series(index=df.index, dtype=float)
+# Backtest: daily equity curves with transaction costs
+def strategy_equity(df, prediction, horizon=HORIZON, cost_bps=COST_BPS):
+    """
+    Non-overlapping trades: on a day the model predicts "up", buy at that close
+    and hold for `horizon` days; otherwise stay in cash and check the next day.
+    Returns the daily equity curve and the daily position (1 = invested).
+    """
+    position = np.zeros(len(df))
     i = 0
+    n_trades = 0
     while i < len(df) - horizon:
-        if df.iloc[i][prediction_col] == 1:
-            buy_price = df.iloc[i][price_col]
-            sell_price = df.iloc[i + horizon][price_col]
-            if pd.notna(buy_price) and pd.notna(sell_price) and buy_price > 0:
-                pct_return = sell_price / buy_price
-                wealth *= pct_return
-                returns.iloc[i] = wealth
+        if prediction[i] == 1:
+            position[i + 1:i + horizon + 1] = 1   # invested from close i to close i + horizon
+            n_trades += 1
             i += horizon
         else:
             i += 1
-    returns.iloc[0] = 1.0 # Starts returns at 1
-    returns.ffill(inplace=True) # Fills empty values with last known valid value
-    return returns
+    daily_ret = df['Close'].pct_change().fillna(0).values
+    strat_ret = position * daily_ret
+    # Charge costs on every change of position (entry and exit)
+    trades = np.abs(np.diff(np.concatenate([[0], position])))
+    strat_ret = strat_ret - trades * cost_bps / 1e4
+    equity = pd.Series(np.cumprod(1 + strat_ret), index=df.index)
+    return equity, pd.Series(position, index=df.index), n_trades
 
-def compute_buy_hold_returns(df, price_col):
-    base_price = df[price_col].iloc[0]
-    return df[price_col] / base_price
+def buy_hold_equity(df):
+    return df['Close'] / df['Close'].iloc[0]
+
+def sharpe(equity):
+    r = equity.pct_change().dropna()
+    return np.sqrt(252) * r.mean() / r.std() if r.std() > 0 else np.nan
+
+def max_drawdown(equity):
+    return (equity / equity.cummax() - 1).min()
 
 # %%
-# Evaluate and summarize performance per stock
+# Evaluate and summarise performance per stock
 summary_stats = []
-
-for ticker, (scores, y_true, y_pred, importances) in results.items():
-    cm = confusion_matrix(y_true, y_pred)
-    avg_importance = np.mean(importances, axis=0)
-    feature_cols = [col for col in data[ticker].columns if col not in ['Target']]
-    feature_importance = dict(zip(feature_cols, avg_importance))
-    sorted_importance = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
-
-    # Compute pseudo-PnL based on prediction
-    df = data[ticker].copy()
-    df = df.iloc[-len(y_true):]  # Align with predictions
-    # df = df.reset_index()
+for ticker, (y_true, y_pred, idx, importances) in results.items():
+    df = data[ticker].loc[idx].copy()
     df['Prediction'] = y_pred
-    df['Actual'] = y_true
-    
-    # Buy and hold benchmark
-    initial_price = df[f'Close_{ticker}'].iloc[0]
-    final_price = df[f'Close_{ticker}'].iloc[-1]
-    buy_hold_return = final_price / initial_price - 1
 
-    # Compute full strategy and buy-and-hold return series using utility functions
-    strategy_returns = compute_strategy_returns(df, f'Close_{ticker}')
-    buy_hold_curve = compute_buy_hold_returns(df, f'Close_{ticker}').loc[strategy_returns.index]
-    
-    cumulative_return = strategy_returns[-1] - 1
+    strat, position, n_trades = strategy_equity(df, y_pred)
+    bh = buy_hold_equity(df)
+    feature_importance = sorted(zip(FEATURES, importances.mean(axis=0)), key=lambda x: x[1], reverse=True)
 
     summary_stats.append({
         "ticker": ticker,
-        "mean_accuracy": np.mean(scores),
-        "confusion_matrix": cm,
-        "top_features": sorted_importance[:5],
-        "cumulative_return": cumulative_return,
-        "buy_hold_return": buy_hold_return,
-        "strategy_returns": strategy_returns,
-        "buy_hold_curve": buy_hold_curve
+        "accuracy": (y_true == y_pred).mean(),
+        "baseline_accuracy": y_true.mean(),          # accuracy of always predicting "up"
+        "confusion_matrix": confusion_matrix(y_true, y_pred, labels=[0, 1]),
+        "top_features": feature_importance[:5],
+        "strategy_return": strat.iloc[-1] - 1,
+        "buy_hold_return": bh.iloc[-1] - 1,
+        "strategy_sharpe": sharpe(strat),
+        "buy_hold_sharpe": sharpe(bh),
+        "strategy_max_dd": max_drawdown(strat),
+        "buy_hold_max_dd": max_drawdown(bh),
+        "time_in_market": position.mean(),
+        "n_trades": n_trades,
+        "strategy_curve": strat,
+        "buy_hold_curve": bh,
     })
 
-# %%
-# Print and plot results for each stock after processing
-for stat in summary_stats:
-    print(f"{stat['ticker']}: Mean Accuracy = {stat['mean_accuracy']:.3f}")
-    print("Confusion Matrix:")
-    print(stat['confusion_matrix'])
-    print("Top Features:")
-    for name, val in stat['top_features']:
-        print(f"  {name}: {val:.4f}")
-    print(f"Cumulative PnL from strategy (non-overlapping): {stat['cumulative_return']:.2%}")
-    print(f"Buy and Hold Return: {stat['buy_hold_return']:.2%}")
-    print()
-
-    # Plotting
-    plt.figure(figsize=(4, 3))
-    sn.heatmap(stat['confusion_matrix'], annot=True, fmt='d', cmap='Blues', xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'])
-    plt.title(f"{stat['ticker']} Confusion Matrix")
-    plt.xlabel('Predicted')
-    plt.ylabel('Actual')
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(8, 4))
-    stat['strategy_returns'].plot(label='Strategy', marker='o')
-    stat['buy_hold_curve'].plot(label='Buy & Hold')
-    plt.title(f"{stat['ticker']} Strategy vs Buy & Hold")
-    plt.ylabel('Cumulative Return')
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+summary_table = pd.DataFrame([{k: v for k, v in s.items()
+                               if not isinstance(v, (pd.Series, np.ndarray, list))}
+                              for s in summary_stats]).set_index('ticker')
 
 # %%
+# Print and plot results
+pd.set_option('display.width', 200)
+print(summary_table.round(3).to_string())
+print("\nMean over tickers:")
+print(summary_table.mean(numeric_only=True).round(3).to_string())
 
+if SHOW_PLOTS:
+    for stat in summary_stats:
+        plt.figure(figsize=(4, 3))
+        sn.heatmap(stat['confusion_matrix'], annot=True, fmt='d', cmap='Blues',
+                   xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'])
+        plt.title(f"{stat['ticker']} Confusion Matrix")
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.tight_layout()
+        plt.show()
+
+        plt.figure(figsize=(8, 4))
+        stat['strategy_curve'].plot(label='Strategy')
+        stat['buy_hold_curve'].plot(label='Buy & Hold')
+        plt.title(f"{stat['ticker']} Strategy vs Buy & Hold")
+        plt.ylabel('Growth of 1')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+# %%
 
 # =======================
 # Dash App for Dashboard
 # =======================
 
-# Dash app for interactive dashboard visualization
 from dash import Dash, dcc, html, Input, Output, dash_table
 import plotly.graph_objs as go
 import plotly.express as px
 
 app = Dash(__name__)
-
 available_tickers = tickers + ['ALL']
+stats_by_ticker = {s['ticker']: s for s in summary_stats}
 
 app.layout = html.Div([
     html.H1("Stock Strategy Dashboard"),
-    
+
     html.P(
-        "The strategy uses a machine learning model (Random Forest) trained on technical indicators "
-        "like RSI, MACD, and moving averages to predict whether a stock's price will rise over the next 21 trading days. "
-        "If the model predicts an increase, the strategy simulates buying the stock and selling it after 21 days. "
-        "This is compared to a simple buy-and-hold approach as a baseline.",
+        "A Random Forest trained on scale-free technical indicators (RSI, MACD, distance from moving "
+        "averages, Bollinger %B, momentum, volatility) predicts whether a stock will be higher in 21 "
+        "trading days. When it predicts an increase, the strategy buys and holds for 21 days, paying "
+        f"{COST_BPS} bps per side. Validation is walk-forward with a {PURGE}-day purge so that no "
+        "training label uses prices from the test period. The results are compared to buy-and-hold, "
+        "and the model's accuracy to the baseline of always predicting \"up\".",
         style={'fontSize': '16px', 'maxWidth': '1000px', 'lineHeight': '1.6'}
     ),
-    
+
     dcc.Dropdown(
-        id='ticker-select', 
-        options=[{'label': t, 'value': t} for t in available_tickers], 
+        id='ticker-select',
+        options=[{'label': t, 'value': t} for t in available_tickers],
         value='ALL'
     ),
 
     html.Div([
-        dcc.Graph(
-            id='strategy-plot',
-            style={'width': '65%'}
-        ),
+        dcc.Graph(id='strategy-plot', style={'width': '65%'}),
         dash_table.DataTable(
             id='summary-table',
-            columns=[
-                {'name': 'Metric', 'id': 'Metric'},
-                {'name': 'Value', 'id': 'Value'}
-            ],
-            style_table={'width': '300px'},
+            columns=[{'name': 'Metric', 'id': 'Metric'}, {'name': 'Value', 'id': 'Value'}],
+            style_table={'width': '340px'},
             style_cell={'textAlign': 'left', 'width': '50%'},
             style_header={'fontWeight': 'bold'}
         )
-    ], style={
-        'display': 'flex',
-        'flexDirection': 'row',
-        'justifyContent': 'flex-start',  
-        'alignItems': 'center',          
-        'gap': '90px',                   
-        'paddingLeft': '40px'            
-    }),
+    ], style={'display': 'flex', 'flexDirection': 'row', 'justifyContent': 'flex-start',
+              'alignItems': 'center', 'gap': '90px', 'paddingLeft': '40px'}),
 
     html.Div([
         dcc.Graph(id='confusion-matrix', style={'display': 'inline-block', 'width': '49%'}),
@@ -303,125 +288,72 @@ app.layout = html.Div([
     ])
 ])
 
+def metric_rows(s):
+    return [
+        {'Metric': 'Model accuracy', 'Value': f"{s['accuracy']:.1%}"},
+        {'Metric': 'Always-up accuracy', 'Value': f"{s['baseline_accuracy']:.1%}"},
+        {'Metric': 'Strategy return', 'Value': f"{s['strategy_return']:.1%}"},
+        {'Metric': 'Buy & hold return', 'Value': f"{s['buy_hold_return']:.1%}"},
+        {'Metric': 'Strategy Sharpe', 'Value': f"{s['strategy_sharpe']:.2f}"},
+        {'Metric': 'Buy & hold Sharpe', 'Value': f"{s['buy_hold_sharpe']:.2f}"},
+        {'Metric': 'Strategy max drawdown', 'Value': f"{s['strategy_max_dd']:.1%}"},
+        {'Metric': 'Buy & hold max drawdown', 'Value': f"{s['buy_hold_max_dd']:.1%}"},
+        {'Metric': 'Time in market', 'Value': f"{s['time_in_market']:.0%}"},
+    ]
+
 @app.callback(
     Output('strategy-plot', 'figure'),
     Output('confusion-matrix', 'figure'),
     Output('confusion-matrix-cumulative', 'figure'),
-    Output('confusion-matrix-cumulative', 'style'),     # Used to make the figure invisible for singe stocks
+    Output('confusion-matrix-cumulative', 'style'),     # hidden for single stocks
     Output('summary-table', 'data'),
     Input('ticker-select', 'value')
 )
 def update_dashboard(selected_ticker):
     if selected_ticker == 'ALL':
-        avg_strategy = []
-        avg_buyhold = []
-        avg_cm = np.zeros((2, 2))
-        count = 0
-        
-        # Goes through each ticker and calculates the cumulative/average of the stats
-        for ticker in tickers:
-            _, y_true, y_pred, _ = results[ticker]
-            df = data[ticker].copy().iloc[-len(y_true):]
-            df['Prediction'] = y_pred
-            strategy_series = compute_strategy_returns(df, f'Close_{ticker}')
-            avg_strategy.append(strategy_series)
-            
-            bh_series = compute_buy_hold_returns(df, f'Close_{ticker}').loc[strategy_series.index]
-            avg_buyhold.append(bh_series)
-            
-            avg_cm += confusion_matrix(y_true, y_pred)
-            count += 1
-            
-        # Align all strategy and buy-hold series to the same length
-        if avg_strategy and avg_buyhold:
-            min_len = min(len(s) for s in avg_strategy)
-            common_index = avg_strategy[0].iloc[:min_len].index
-            strategy_matrix = np.stack([s.values[:min_len] for s in avg_strategy])
-            buyhold_matrix = np.stack([s.values[:min_len] for s in avg_buyhold])
-            
-        # Add data to figures
-        fig1 = go.Figure()
-        fig1.add_trace(go.Scatter(x=common_index, y=np.mean(strategy_matrix, axis=0), name='Strategy'))
-        fig1.add_trace(go.Scatter(x=common_index, y=np.mean(buyhold_matrix, axis=0), name='Buy & Hold'))
-        fig1.update_layout(title='Average Strategy vs Buy & Hold', yaxis_title='Cumulative Return')
+        # Equal-weight average of the per-stock curves over their common dates
+        strat_curves = pd.concat([s['strategy_curve'] for s in summary_stats], axis=1).dropna()
+        bh_curves = pd.concat([s['buy_hold_curve'] for s in summary_stats], axis=1).dropna()
 
-        fig2 = px.imshow(avg_cm / count if count > 0 else avg_cm, text_auto=True, color_continuous_scale='Blues', labels=dict(x="Predicted", y="Actual"))
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(x=strat_curves.index, y=strat_curves.mean(axis=1), name='Strategy'))
+        fig1.add_trace(go.Scatter(x=bh_curves.index, y=bh_curves.mean(axis=1), name='Buy & Hold'))
+        fig1.update_layout(title='Average Strategy vs Buy & Hold', yaxis_title='Growth of 1')
+
+        total_cm = sum(s['confusion_matrix'] for s in summary_stats)
+        fig2 = px.imshow(total_cm / len(summary_stats), text_auto='.0f', color_continuous_scale='Blues',
+                         labels=dict(x="Predicted", y="Actual"), x=['Down', 'Up'], y=['Down', 'Up'])
         fig2.update_layout(title='Average Confusion Matrix')
-        
-        fig3 = px.imshow(avg_cm, text_auto=True, color_continuous_scale='Blues', labels=dict(x="Predicted", y="Actual"))
+        fig3 = px.imshow(total_cm, text_auto=True, color_continuous_scale='Blues',
+                         labels=dict(x="Predicted", y="Actual"), x=['Down', 'Up'], y=['Down', 'Up'])
         fig3.update_layout(title='Cumulative Confusion Matrix')
-        
-        # Aggregate feature importance by prefix
-        from collections import defaultdict
 
-        prefix_importance = defaultdict(list)
+        mean = summary_table.mean(numeric_only=True)
+        rows = metric_rows(mean)
 
-        for stat in summary_stats:
-            for name, val in stat['top_features']:
-                # Remove ticker suffix if present
-                parts = name.split('_')
-                if len(parts) >= 2 and parts[-1] in tickers:
-                    stripped = '_'.join(parts[:-1])
-                else:
-                    stripped = name
-                prefix_importance[stripped].append(val)
+        # Average feature importance across tickers
+        imp = pd.DataFrame([dict(s['top_features']) for s in summary_stats]).mean().sort_values(ascending=False)
+        for i, (name, val) in enumerate(imp.head(3).items(), 1):
+            rows.append({'Metric': f'Feature rank {i} (weight)', 'Value': f"{name} ({val:.3f})"})
 
-        # Average by prefix
-        avg_prefix_importance = {k: np.mean(v) for k, v in prefix_importance.items()}
-        top_features_all = sorted(avg_prefix_importance.items(), key=lambda x: x[1], reverse=True)[:3] # gets the top 3 most important features through all tickers
-        
-        summary_data = [
-        {'Metric': 'Mean Accuracy', 'Value': f"{np.mean([np.mean(results[t][0]) for t in tickers]):.2%}"},
-        {'Metric': 'Mean Strategy Return', 'Value': f"{np.mean([s['cumulative_return'] for s in summary_stats]):.2%}"},
-        {'Metric': 'Mean Buy & Hold Return', 'Value': f"{np.mean([s['buy_hold_return'] for s in summary_stats]):.2%}"}
-        ]
-        
-        # Adds the features to the table
-        for i, (name, val) in enumerate(top_features_all, 1):
-            summary_data.append({'Metric': f'Feature Rank {i} (Weight)', 'Value': f"{name} ({val:.3f})"})
-        
-        return fig1, fig2, fig3, {'display': 'inline-block', 'width': '49%'}, summary_data
-    
-    else:
-        _, y_true, y_pred, _ = results[selected_ticker]
-        df = data[selected_ticker].copy().iloc[-len(y_true):]
-        df['Prediction'] = y_pred
-        # Compute return curves using shared functions
-        strategy_series = compute_strategy_returns(df, f'Close_{selected_ticker}')
-        bh_series = compute_buy_hold_returns(df, f'Close_{selected_ticker}').loc[strategy_series.index]
+        return fig1, fig2, fig3, {'display': 'inline-block', 'width': '49%'}, rows
 
-        # Add data to figures
-        fig1 = go.Figure()
-        fig1.add_trace(go.Scatter(x=strategy_series.index, y=strategy_series.values, name='Strategy'))
-        fig1.add_trace(go.Scatter(x=bh_series.index, y=bh_series.values, name='Buy & Hold'))
-        fig1.update_layout(title=f'{selected_ticker} Strategy vs Buy & Hold', yaxis_title='Cumulative Return')
+    s = stats_by_ticker[selected_ticker]
+    fig1 = go.Figure()
+    fig1.add_trace(go.Scatter(x=s['strategy_curve'].index, y=s['strategy_curve'].values, name='Strategy'))
+    fig1.add_trace(go.Scatter(x=s['buy_hold_curve'].index, y=s['buy_hold_curve'].values, name='Buy & Hold'))
+    fig1.update_layout(title=f'{selected_ticker} Strategy vs Buy & Hold', yaxis_title='Growth of 1')
 
-        cm = confusion_matrix(y_true, y_pred)
-        fig2 = px.imshow(cm, text_auto=True, color_continuous_scale='Blues', labels=dict(x="Predicted", y="Actual"))
-        fig2.update_layout(title=f'{selected_ticker} Confusion Matrix')
-        
-        summary = next(s for s in summary_stats if s['ticker'] == selected_ticker)
-        top_features = summary['top_features'][:3]
-        summary_data = [
-            {'Metric': 'Accuracy', 'Value': f"{summary['mean_accuracy']:.2%}"},
-            {'Metric': 'Strategy Return', 'Value': f"{summary['cumulative_return']:.2%}"},
-            {'Metric': 'Buy & Hold Return', 'Value': f"{summary['buy_hold_return']:.2%}"}
-        ]
-        
-        for i, (name, val) in enumerate(top_features, 1):
-            summary_data.append({'Metric': f'Feature Rank {i} (Weight)', 'Value': f"{name} ({val:.3f})"})
-        
-        # Returns an invisible cumulative confusion matrix
-        return fig1, fig2, go.Figure(), {'display': 'none'}, summary_data
+    fig2 = px.imshow(s['confusion_matrix'], text_auto=True, color_continuous_scale='Blues',
+                     labels=dict(x="Predicted", y="Actual"), x=['Down', 'Up'], y=['Down', 'Up'])
+    fig2.update_layout(title=f'{selected_ticker} Confusion Matrix')
+
+    rows = metric_rows(s)
+    for i, (name, val) in enumerate(s['top_features'][:3], 1):
+        rows.append({'Metric': f'Feature rank {i} (weight)', 'Value': f"{name} ({val:.3f})"})
+
+    return fig1, fig2, go.Figure(), {'display': 'none'}, rows
 
 
 if __name__ == '__main__':
     app.run(debug=True, host='127.0.0.1', port=8050)
-    
-    
-    
-    
-    
-    
-    
-    
